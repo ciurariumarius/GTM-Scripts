@@ -1,6 +1,6 @@
 <script>
 /*
- * GTM Custom HTML - Universal same-page form success tracker
+ * GTM Custom HTML - Universal form success tracker (AJAX + page reload)
  *
  * Pentru majoritatea formularelor nu este necesara configurare.
  * Selectorii si textele de mai jos sunt doar extensii optionale si se adauga
@@ -45,7 +45,9 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
       '.forminator-ui',
       '#mc_embed_signup',
       '.w-form',
-      '.et_pb_contact_form_container'
+      '.et_pb_contact_form_container',
+      '.visform',
+      '.visforms-form-form'
     ],
 
     submitSelectors: [
@@ -90,7 +92,11 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
       '.form-success',
       '.form-success-message',
       '.success-message',
-      '[data-form-success]'
+      '[data-form-success]',
+      '.visforms-form-message',
+      'joomla-alert[type="success"]',
+      '#system-message-container .alert-success',
+      '#system-message .alert-success'
     ],
 
     /*
@@ -105,7 +111,10 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
       '.wpcf7-response-output',
       '.elementor-message',
       '.et-pb-contact-message',
-      '.form-status'
+      '.form-status',
+      '#system-message-container .alert-message',
+      '#system-message .alert-message',
+      'joomla-alert .alert-message'
     ],
 
     successTextIncludes: [
@@ -156,6 +165,7 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     successEventName: 'form_submit_complete',
     successWindowMs: 60000,
     interactionWindowMs: 1800000,
+    crossPageWindowMs: 300000,
     dedupeWindowMs: 2000,
     maxMessageLength: 600,
     captureUserData: true,
@@ -165,6 +175,7 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
   var DATA_KEY = '__gtmUniversalFormCaptureData';
   var INTERACTION_KEY = '__gtmUniversalFormInteractionStarted';
   var LAST_PUSH_KEY = '__gtmUniversalFormLastPushAt';
+  var STORAGE_KEY = '__gtmUniversalFormPendingSubmissionV1';
   var custom = w.GTM_FORM_SUCCESS_CONFIG || {};
   var attemptSequence = 0;
   var pendingAttempts = [];
@@ -251,6 +262,10 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
       typeof custom.interactionWindowMs === 'number'
         ? custom.interactionWindowMs
         : DEFAULTS.interactionWindowMs,
+    crossPageWindowMs:
+      typeof custom.crossPageWindowMs === 'number'
+        ? custom.crossPageWindowMs
+        : DEFAULTS.crossPageWindowMs,
     dedupeWindowMs:
       typeof custom.dedupeWindowMs === 'number'
         ? custom.dedupeWindowMs
@@ -284,6 +299,10 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     args = Array.prototype.slice.call(arguments);
     args.unshift('[GTM form tracker]');
     w.console.log.apply(w.console, args);
+  }
+
+  function getPageLocation() {
+    return String(w.location && w.location.href || '');
   }
 
   function matches(el, selector) {
@@ -579,6 +598,112 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     );
   }
 
+  function clearPersistedSubmission() {
+    try {
+      w.sessionStorage.removeItem(STORAGE_KEY);
+    } catch (e) {
+      log('sessionStorage nu este disponibil.');
+    }
+  }
+
+  function persistSubmission(attempt) {
+    var data;
+    var payload;
+
+    if (!attempt) {
+      return;
+    }
+
+    data = captureFormData(
+      attempt.container,
+      attempt.container[DATA_KEY]
+    );
+    attempt.container[DATA_KEY] = data;
+    payload = {
+      savedAt: new Date().getTime(),
+      formId: getFormId(attempt.container),
+      sourceUrl: attempt.formLocation || getPageLocation(),
+      data: CONFIG.captureUserData
+        ? {
+            email: data.email || '',
+            phone_number: data.phone_number || ''
+          }
+        : null
+    };
+
+    try {
+      w.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      log('Tentativa a fost salvata pentru o posibila navigare.');
+    } catch (e) {
+      log('Tentativa nu a putut fi salvata in sessionStorage.');
+    }
+  }
+
+  function takePersistedSubmission() {
+    var raw;
+    var saved;
+    var now = new Date().getTime();
+
+    try {
+      raw = w.sessionStorage.getItem(STORAGE_KEY);
+
+      if (!raw) {
+        return null;
+      }
+
+      /* Se consuma o singura data, pentru a evita conversii la refresh. */
+      w.sessionStorage.removeItem(STORAGE_KEY);
+      saved = JSON.parse(raw);
+    } catch (e) {
+      return null;
+    }
+
+    if (
+      !saved ||
+      !saved.savedAt ||
+      now - saved.savedAt < 0 ||
+      now - saved.savedAt > CONFIG.crossPageWindowMs
+    ) {
+      return null;
+    }
+
+    return saved;
+  }
+
+  function restorePersistedSubmission() {
+    var saved = takePersistedSubmission();
+    var attempt;
+    var remaining;
+
+    if (!saved || !d.documentElement) {
+      return;
+    }
+
+    d.documentElement[DATA_KEY] = saved.data || {
+      email: '',
+      phone_number: ''
+    };
+    attempt = {
+      id: ++attemptSequence,
+      container: d.documentElement,
+      formId: saved.formId || '(no form id)',
+      formLocation: saved.sourceUrl || getPageLocation(),
+      startedAt: saved.savedAt,
+      source: 'cross_page_restore',
+      windowMs: CONFIG.crossPageWindowMs,
+      baseline: []
+    };
+    pendingAttempts.push(attempt);
+    remaining = CONFIG.crossPageWindowMs -
+      (new Date().getTime() - saved.savedAt);
+
+    w.setTimeout(function () {
+      removeAttempt(attempt);
+    }, Math.max(remaining, 0) + 100);
+
+    log('Tentativa a fost restaurata dupa navigare:', attempt.formId);
+  }
+
   function isUserField(field) {
     var tag;
     var type;
@@ -629,6 +754,7 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     w.dataLayer.push({
       event: CONFIG.interactionEventName,
       form_id: getFormId(container),
+      form_location: getPageLocation(),
       field_name: field.name || field.id || '(no field name)',
       field_type: String(field.type || field.tagName || '').toLowerCase()
     });
@@ -732,6 +858,7 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     attempt = {
       id: ++attemptSequence,
       container: container,
+      formLocation: getPageLocation(),
       startedAt: new Date().getTime(),
       source: source,
       windowMs: windowMs || CONFIG.successWindowMs,
@@ -741,6 +868,10 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     snapshotExistingSuccess(attempt);
     pendingAttempts.push(attempt);
     log('Tentativa detectata:', source, getFormId(container));
+
+    if (source === 'submit' || source === 'formdata') {
+      persistSubmission(attempt);
+    }
 
     w.setTimeout(function () {
       removeAttempt(attempt);
@@ -915,6 +1046,7 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     payload = {
       event: CONFIG.successEventName,
       form_id: attempt.formId || getFormId(attempt.container),
+      form_location: attempt.formLocation || getPageLocation(),
       trigger_type: 'success'
     };
 
@@ -929,6 +1061,7 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     w.dataLayer.push(payload);
 
     log('Succes confirmat:', payload.form_id, successElement);
+    clearPersistedSubmission();
     removeAttempt(attempt);
     attempt.container[DATA_KEY] = null;
     attempt.container[INTERACTION_KEY] = false;
@@ -970,6 +1103,7 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
       attempt = {
         id: ++attemptSequence,
         container: container,
+        formLocation: getPageLocation(),
         startedAt: new Date().getTime(),
         source: source,
         baseline: []
@@ -1108,6 +1242,45 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     }
   }
 
+  function scanExistingSuccess() {
+    var elements;
+    var i;
+
+    if (!pendingAttempts.length) {
+      return;
+    }
+
+    if (SCAN_SELECTOR) {
+      try {
+        elements = d.querySelectorAll(SCAN_SELECTOR);
+      } catch (e) {
+        elements = [];
+      }
+
+      for (i = 0; i < elements.length; i++) {
+        if (considerCandidate(elements[i]) || !pendingAttempts.length) {
+          return;
+        }
+      }
+    }
+
+    /* Fallback pentru pagini server-side cu text, dar fara clasa semantica. */
+    try {
+      elements = d.querySelectorAll(
+        'main p, main div, main h1, main h2, main h3, ' +
+        'article p, article div, article h1, article h2, article h3'
+      );
+    } catch (e) {
+      elements = [];
+    }
+
+    for (i = 0; i < elements.length; i++) {
+      if (considerCandidate(elements[i]) || !pendingAttempts.length) {
+        return;
+      }
+    }
+  }
+
   d.addEventListener('input', function (event) {
     handleInteraction(event.target);
   }, true);
@@ -1156,7 +1329,11 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     if (
       (key !== 'Enter' && key !== 13) ||
       tag === 'textarea' ||
-      (event.target && event.target.getAttribute('contenteditable') === 'true')
+      (
+        event.target &&
+        event.target.getAttribute &&
+        event.target.getAttribute('contenteditable') === 'true'
+      )
     ) {
       return;
     }
@@ -1211,6 +1388,8 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     d.addEventListener('DOMContentLoaded', attachGravityFormsListener, false);
   }
 
+  restorePersistedSubmission();
+
   if (w.MutationObserver) {
     new w.MutationObserver(handleMutations).observe(d.documentElement, {
       childList: true,
@@ -1227,6 +1406,12 @@ window.GTM_FORM_SUCCESS_CONFIG = window.GTM_FORM_SUCCESS_CONFIG || {
     });
   } else {
     log('MutationObserver nu este disponibil in acest browser.');
+  }
+
+  if (d.readyState === 'loading') {
+    d.addEventListener('DOMContentLoaded', scanExistingSuccess, false);
+  } else {
+    w.setTimeout(scanExistingSuccess, 0);
   }
 })(window, document);
 </script>
